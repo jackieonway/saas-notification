@@ -1,0 +1,15 @@
+{
+  "name": "notification-ws",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dante Cloud 实时通知 WebSocket mini-service (socket.io + PostgreSQL LISTEN/NOTIFY, 端口 3003, node --watch)",
+  "scripts": {
+    "dev": "node --watch index.ts"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.3",
+    "postgres": "^3.4.9",
+    "socket.io": "^4.8.4"
+  }
+}
