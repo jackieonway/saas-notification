@@ -3,13 +3,18 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Dante Cloud 实时通知 WebSocket mini-service (socket.io + PostgreSQL LISTEN/NOTIFY, 端口 3003, node --watch)",
+  "description": "Scoped real-time notification hints with platform session validation and PostgreSQL LISTEN",
   "scripts": {
-    "dev": "node --watch index.ts"
+    "start": "node index.ts",
+    "dev": "node --watch index.ts",
+    "test": "node --test tests/*.mjs"
   },
+  "engines": { "node": ">=24" },
   "dependencies": {
-    "jsonwebtoken": "^9.0.3",
-    "postgres": "^3.4.9",
+    "pg": "^8.16.3",
     "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.4"
   }
 }
