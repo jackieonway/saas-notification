@@ -48,3 +48,15 @@ test('deployment timer and port bounds reject unsafe or invalid values', () => {
     assert.throws(() => loadConfig({ ...base, [name]: value }), new RegExp(name))
   }
 })
+
+test('production notification peers use exact HTTPS and an independent strong metrics token', () => {
+  const production = { ...base, NODE_ENV: 'production', PLATFORM_API_BASE_URL: 'https://platform.example.test',
+    METRICS_TOKEN: 'FixtureOnlyMetricsToken0123456789AbCd' }
+  assert.equal(loadConfig(production).production, true)
+  assert.throws(() => loadConfig({ ...production, METRICS_TOKEN: undefined }), /METRICS_TOKEN/)
+  for (const field of ['PLATFORM_API_BASE_URL', 'NOTIFICATION_ALLOWED_ORIGINS']) {
+    for (const value of ['http://127.0.0.1:3000', 'http://outside.example.test']) assert.throws(() => loadConfig({ ...production, [field]: value }), /HTTPS/)
+    assert.throws(() => loadConfig({ ...base, [field]: 'http://outside.example.test' }), /HTTPS/)
+  }
+  assert.equal(loadConfig(base).metricsToken, null)
+})

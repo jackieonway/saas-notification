@@ -1,3 +1,5 @@
+import { metricsToken } from './observability.mjs'
+
 function integer(env, name, fallback, minimum, maximum) {
   const raw = env[name] ?? String(fallback)
   if (!/^\d+$/.test(raw) || Number(raw) < minimum || Number(raw) > maximum) {
@@ -6,15 +8,18 @@ function integer(env, name, fallback, minimum, maximum) {
   return Number(raw)
 }
 
-function origin(value, name) {
+function origin(value, name, production) {
   try {
     const url = new URL(value)
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.origin !== value) throw new Error()
+    if (url.username || url.password || url.origin !== value || (url.protocol !== 'https:' &&
+        !(url.protocol === 'http:' && !production && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)))) throw new Error()
     return url.origin
-  } catch { throw new Error(`${name} must contain exact HTTP(S) origins without paths or credentials`) }
+  } catch { throw new Error(`${name} must contain exact HTTPS origins (development permits loopback HTTP) without paths or credentials`) }
 }
 
 export function loadConfig(env = process.env) {
+  const production = env.NODE_ENV === 'production'
+  if (production && env.NODE_TLS_REJECT_UNAUTHORIZED === '0') throw new Error('NODE_TLS_REJECT_UNAUTHORIZED cannot disable production TLS verification')
   const databaseUrl = env.DATABASE_URL?.trim()
   const platformApiBaseUrl = env.PLATFORM_API_BASE_URL?.trim()
   const allowed = env.NOTIFICATION_ALLOWED_ORIGINS?.trim()
@@ -23,9 +28,9 @@ export function loadConfig(env = process.env) {
     if (!['postgres:', 'postgresql:'].includes(new URL(databaseUrl).protocol)) throw new Error()
   } catch { throw new Error('DATABASE_URL must be a PostgreSQL connection URL') }
   if (!platformApiBaseUrl) throw new Error('PLATFORM_API_BASE_URL is required')
-  origin(platformApiBaseUrl, 'PLATFORM_API_BASE_URL')
+  origin(platformApiBaseUrl, 'PLATFORM_API_BASE_URL', production)
   if (!allowed) throw new Error('NOTIFICATION_ALLOWED_ORIGINS is required')
-  const allowedOrigins = [...new Set(allowed.split(',').map((value) => origin(value.trim(), 'NOTIFICATION_ALLOWED_ORIGINS')))]
+  const allowedOrigins = [...new Set(allowed.split(',').map((value) => origin(value.trim(), 'NOTIFICATION_ALLOWED_ORIGINS', production)))]
   const socketPath = env.NOTIFICATION_SOCKET_PATH ?? '/socket.io/'
   if (!/^\/[a-zA-Z0-9/._-]+\/$/.test(socketPath) || socketPath.includes('//') || socketPath === '/' ||
       socketPath.split('/').some((part) => part === '.' || part === '..')) {
@@ -34,6 +39,7 @@ export function loadConfig(env = process.env) {
   const host = env.NOTIFICATION_HOST?.trim() || '0.0.0.0'
   if (/[\s/\\]/.test(host)) throw new Error('NOTIFICATION_HOST must be a bind address')
   return Object.freeze({
+    production, metricsToken: metricsToken(env, production),
     databaseUrl,
     platformApiBaseUrl,
     allowedOrigins: Object.freeze(allowedOrigins),

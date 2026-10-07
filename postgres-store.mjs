@@ -87,8 +87,11 @@ export function createPostgresStore(config, logger = console) {
     },
     async ping() {
       // Check the Phase10 schema and privileges too; old-schema SELECT 1 is insufficient.
-      await pool.query(`SELECT id, tenant_id, organization_id, source_kind, application_id, publication_id
-        FROM notifications WHERE source_kind IN ('APP', 'SYSTEM') LIMIT 0`)
+      let queryError
+      try {
+        await pool.query(`SELECT id, tenant_id, organization_id, source_kind, application_id, publication_id
+          FROM notifications WHERE source_kind IN ('APP', 'SYSTEM') LIMIT 0`)
+      } catch (error) { queryError = error }
       // A separate pool can be healthy while its idle LISTEN socket is broken.
       // Ping that exact connection too, and rebuild it on an uncertain result.
       if (listenerReady && listener) {
@@ -96,6 +99,7 @@ export function createPostgresStore(config, logger = console) {
         const failed = listenerFailure
         try { await checked.query('SELECT 1') } catch { failed() }
       }
+      if (queryError) throw queryError
     },
     async stop() {
       stopped = true

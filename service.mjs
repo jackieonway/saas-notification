@@ -3,6 +3,7 @@ import { Server } from 'socket.io'
 import { loadConfig } from './config.mjs'
 import { createPostgresStore } from './postgres-store.mjs'
 import { probePlatform, validateSession, validId } from './platform-session.mjs'
+import { createTelemetry, metricsAllowed, requestId } from './observability.mjs'
 
 const CONTRACT = '1.0'
 const TYPES = new Set(['INFO', 'SUCCESS', 'WARNING', 'SECURITY'])
@@ -48,6 +49,11 @@ function authenticationToken(data) {
 export function createNotificationService(config, { store = createPostgresStore(config), logger = console } = {}) {
   const allowedOrigins = new Set(config.allowedOrigins)
   const states = new Map()
+  const requestTraces = new WeakMap()
+  const traceFor = (request) => {
+    if (!requestTraces.has(request)) requestTraces.set(request, requestId(request.headers['x-request-id']))
+    return requestTraces.get(request)
+  }
   const lifetime = new AbortController()
   const checks = { database: 'UNKNOWN', listen: 'DOWN', platform: 'UNKNOWN' }
   let stopping = false
@@ -59,6 +65,14 @@ export function createNotificationService(config, { store = createPostgresStore(
   let hintChain = Promise.resolve()
   let pendingHints = 0
   const snapshot = () => ({ status: Object.values(checks).every((value) => value === 'UP') ? 'UP' : 'DOWN', checks: { ...checks } })
+  const telemetry = createTelemetry({ service: 'notification-ws', logger, routeFor: (request) => {
+    const path = requestPath(request)
+    return ['/health', '/health/live', '/metrics'].includes(path) ? path : path?.startsWith(config.socketPath) ? '/socket.io/' : 'OTHER'
+  }, gauges: () => ({ saas_notification_clients: states.size,
+    saas_notification_authenticated_clients: [...states.values()].filter((state) => state.context && !state.closed).length,
+    saas_notification_pending_hints: pendingHints, saas_notification_listen_up: Number(checks.listen === 'UP'),
+    saas_database_up: Number(checks.database === 'UP'), saas_platform_up: Number(checks.platform === 'UP'),
+    saas_health_up: Number(snapshot().status === 'UP') }) })
 
   async function probeHealth() {
     if (probePromise) return probePromise
@@ -80,6 +94,11 @@ export function createNotificationService(config, { store = createPostgresStore(
       response.end(JSON.stringify(body))
     }
     if (!path) { send(400, { message: 'Invalid request path' }); return }
+    if (path === '/metrics' && request.method === 'GET') {
+      if (!metricsAllowed(request.headers.authorization, config.metricsToken)) { send(401, { message: 'Metrics authentication required' }); return }
+      response.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8', 'Cache-Control': 'no-store' })
+      response.end(telemetry.render()); return
+    }
     if (request.method === 'GET' && path === '/health/live') { send(200, { status: 'UP' }); return }
     if (request.method === 'GET' && path === '/health') {
       void probeHealth().then((health) => send(health.status === 'UP' ? 200 : 503, health), () => send(503, snapshot()))
@@ -93,6 +112,8 @@ export function createNotificationService(config, { store = createPostgresStore(
     cors: { origin: [...allowedOrigins], methods: ['GET', 'POST'], credentials: false },
     allowRequest: (request, callback) => callback(null, typeof request.headers.origin === 'string' && allowedOrigins.has(request.headers.origin)),
   })
+  httpServer.prependListener('request', (request, response) => { telemetry.observe(request, response, { requestId: traceFor(request) }) })
+  io.engine.on('headers', (headers, request) => { headers['X-Request-Id'] = traceFor(request) })
   httpServer.prependListener('upgrade', (request, socket) => {
     const path = requestPath(request)
     if (!path || (path.startsWith(config.socketPath) && !allowedOrigins.has(request.headers.origin))) {
@@ -104,6 +125,7 @@ export function createNotificationService(config, { store = createPostgresStore(
   function reject(socket, state) {
     if (state.closed) return
     state.closed = true
+    if (!stopping) telemetry.count('saas_notification_auth_denials_total')
     state.abort.abort()
     clearTimeout(state.waitTimer)
     clearTimeout(state.expiryTimer)
@@ -128,7 +150,7 @@ export function createNotificationService(config, { store = createPostgresStore(
       return null
     }
     try {
-      const context = await validateSession(config, state.token, notificationId, AbortSignal.any([lifetime.signal, state.abort.signal]))
+      const context = await validateSession(config, state.token, notificationId, AbortSignal.any([lifetime.signal, state.abort.signal]), state)
       if (stopping || state.closed || !socket.connected) return null
       if (!sameIdentity(context, state.context)) { reject(socket, state); return null }
       return armExpiry(socket, state, context) ? context : null
@@ -143,7 +165,8 @@ export function createNotificationService(config, { store = createPostgresStore(
   }
 
   io.on('connection', (socket) => {
-    const state = { attempted: false, closed: false, context: null, token: null, abort: new AbortController(), rechecking: false }
+    const state = { attempted: false, closed: false, context: null, token: null, abort: new AbortController(), rechecking: false,
+      requestId: traceFor(socket.request) }
     states.set(socket.id, state)
     state.waitTimer = setTimeout(() => reject(socket, state), config.authWaitMs)
     state.waitTimer.unref?.()
@@ -154,7 +177,7 @@ export function createNotificationService(config, { store = createPostgresStore(
       if (!token) { reject(socket, state); return }
       state.token = token
       try {
-        const context = await validateSession(config, token, undefined, AbortSignal.any([lifetime.signal, state.abort.signal]))
+        const context = await validateSession(config, token, undefined, AbortSignal.any([lifetime.signal, state.abort.signal]), state)
         if (stopping || state.closed || !socket.connected) return
         state.context = context
         if (!armExpiry(socket, state, context)) return
@@ -180,6 +203,7 @@ export function createNotificationService(config, { store = createPostgresStore(
     let row
     try { row = await store.getNotification(hint) } catch {
       checks.database = 'DOWN'
+      telemetry.count('saas_notification_hint_errors_total')
       logger.warn('[notification-ws] notification lookup unavailable; hint dropped')
       return false
     }
@@ -198,7 +222,7 @@ export function createNotificationService(config, { store = createPostgresStore(
   function handleHint(raw) {
     const hint = parseHint(raw)
     if (!hint || stopping) return Promise.resolve(false)
-    if (pendingHints >= MAX_PENDING_HINTS) { logger.warn('[notification-ws] realtime hint backlog full; hint dropped'); return Promise.resolve(false) }
+    if (pendingHints >= MAX_PENDING_HINTS) { telemetry.count('saas_notification_hint_drops_total'); logger.warn('[notification-ws] realtime hint backlog full; hint dropped'); return Promise.resolve(false) }
     pendingHints++
     const pending = hintChain.then(() => deliverHint(hint)).finally(() => { pendingHints-- })
     hintChain = pending.catch(() => logger.warn('[notification-ws] realtime hint handling failed'))

@@ -15,12 +15,13 @@ node --env-file=.env index.ts
 
 容器构建上下文为本服务目录：`docker build -t dante-notification-ws mini-services/notification-ws`。部署提供必填环境变量，并让网关保留 `/socket.io/` 路径转发 polling 与 WebSocket；宿主使用相同路径。Dockerfile 使用 Node 24 和非 root 用户；没有依赖项目之外的个人开发机文件。
 
-仓库 Compose 已编排 `notification-ws`，只在容器网络暴露 3003；内部平台 URL 为 `PLATFORM_API_BASE_URL=http://backend:3001`。`NOTIFICATION_DATABASE_URL` 可覆盖独立读取账号，未配置时复用本地 Compose 数据库；通知容器不接收 `JWT_SECRET`。`NOTIFICATION_ALLOWED_ORIGINS` 默认采用 `PUBLIC_APP_URL`，否则仅 `http://localhost`，生产和自定义 HTTP 端口必须显式设置实际浏览器 origin。
+仓库 Compose 已编排 `notification-ws`，只在容器网络暴露 3003。生产 `PLATFORM_API_BASE_URL` 和浏览器来源必须显式配置精确 HTTPS origin；开发模式仅允许 loopback HTTP，容器 DNS 的 HTTP 不属于此例外。`NOTIFICATION_DATABASE_URL` 可覆盖独立读取账号；通知容器不接收 `JWT_SECRET`。生产设置 `NODE_ENV=production`、独立 `METRICS_TOKEN` 和实际浏览器 origin；测试 CA 通过 `NODE_EXTRA_CA_CERTS` 加载，禁止关闭 TLS 验证。
 
 | 变量 | 默认或范围 | 用途 |
 | --- | --- | --- |
 | `DATABASE_URL` | 必填 PostgreSQL URL | 查询通知与独立 LISTEN 连接 |
-| `PLATFORM_API_BASE_URL` | 必填精确 HTTP(S) origin | 例 `http://backend:3001`；无路径、query 或凭据 |
+| `PLATFORM_API_BASE_URL` | 必填精确 HTTPS origin | 无路径、query 或凭据；开发额外允许 loopback HTTP |
+| `NODE_ENV` / `METRICS_TOKEN` | 生产必须 `production` 与独立随机 token | 私有 `/metrics` 的精确 Bearer；至少 32 字符，不能是占位值 |
 | `NOTIFICATION_ALLOWED_ORIGINS` | 必填，逗号分隔精确 origin | 同时约束 polling、WebSocket 握手和升级；不支持 `*` 或 `null` |
 | `NOTIFICATION_HOST` / `NOTIFICATION_PORT` | `0.0.0.0` / `3003` | HTTP/Socket.IO 监听 |
 | `NOTIFICATION_SOCKET_PATH` | `/socket.io/` | 明确专用路径，以 `/` 结尾；不允许根路径 |
@@ -49,6 +50,8 @@ node --env-file=.env index.ts
 ## 健康与断线恢复
 
 `GET /health/live` 返回进程存活。`GET /health` 同时检查数据库新 schema 可查询、LISTEN 已建立和平台保护路由可达，全部 UP 才返回 200，否则 503；JSON 的 `checks.database/listen/platform` 分别显示 UP、DOWN 或 UNKNOWN。未带 Bearer 的平台探针必须收到 401，这只证明保护路由存在。
+
+`GET /metrics` 只接受独立监控 Bearer。生产网关拒绝暴露该路由，私有 runner 从同机 loopback 抓取。请求日志为 JSON、路由与指标 labels 使用静态集合，不包含查询、用户／会话 ID、token 或通知内容；合法 UUID `X-Request-Id` 会返回并传递给内部会话验证。完整指标和本地 DOWN／RECOVERED 告警配置见[可观测性文档](../../docs/observability.md)。
 
 LISTEN 用独立 PostgreSQL Client。断开立即将 listen 标为 DOWN，关闭旧连接并按有上限的退避新建连接，重新成功 LISTEN 后恢复 UP。查询使用独立连接池；就绪探针还会 ping 该条 LISTEN 连接，避免连接池正常却监听链路失效。`pg_stat_activity.application_name` 分别是 `dante-notification-listen` 与 `dante-notification-query`。终止信号会关闭 Socket.IO、timer、HTTP 和数据库连接。
 

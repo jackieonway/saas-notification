@@ -39,7 +39,7 @@ async function readJson(response, signal) {
   } finally { reader.releaseLock() }
 }
 
-export async function validateSession(config, token, notificationId, parentSignal) {
+export async function validateSession(config, token, notificationId, parentSignal, metadata = {}) {
   const timeout = AbortSignal.timeout(config.authTimeoutMs)
   const signal = parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout
   const url = new URL('/api/notifications/socket-context', config.platformApiBaseUrl)
@@ -47,7 +47,8 @@ export async function validateSession(config, token, notificationId, parentSigna
   try {
     const response = await fetch(url, {
       method: 'GET', redirect: 'error', signal,
-      headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+      headers: { Accept: 'application/json', Authorization: `Bearer ${token}`,
+        ...(validId(metadata.requestId) ? { 'X-Request-Id': metadata.requestId } : {}) },
     })
     if (response.status !== 200) {
       await response.body?.cancel()

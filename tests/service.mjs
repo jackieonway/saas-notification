@@ -81,7 +81,8 @@ async function fixture(t, configOverrides = {}) {
   const platform = createServer((incoming, outgoing) => {
     const url = new URL(incoming.url, 'http://platform.fixture')
     const authorization = incoming.headers.authorization
-    state.requests.push({ method: incoming.method, pathname: url.pathname, notificationId: url.searchParams.get('notificationId'), authorization })
+    state.requests.push({ method: incoming.method, pathname: url.pathname, notificationId: url.searchParams.get('notificationId'), authorization,
+      requestId: incoming.headers['x-request-id'] })
     if (url.pathname === '/redirect-target') {
       state.redirectVisits++
       outgoing.writeHead(200, { 'Content-Type': 'application/json' })
@@ -165,9 +166,9 @@ function addToken(state, token = 'fixture-platform-session-token', value = conte
   return token
 }
 
-function client(state, { origin = ORIGIN, transport = 'websocket' } = {}) {
+function client(state, { origin = ORIGIN, transport = 'websocket', requestId } = {}) {
   const socket = createClient(state.serviceUrl, {
-    path: state.config.socketPath, transports: [transport], extraHeaders: { Origin: origin },
+    path: state.config.socketPath, transports: [transport], extraHeaders: { Origin: origin, ...(requestId ? { 'X-Request-Id': requestId } : {}) },
     reconnection: false, forceNew: true, timeout: 1000, autoConnect: false,
   })
   const result = { socket, authenticated: [], unauthorized: [], notifications: [], disconnects: [], connectErrors: [] }
@@ -223,6 +224,58 @@ test('HTTP/DB fixtures: initial auth delegates only the Bearer and exposes the s
   assert.ok(state.requests.some((item) => item.pathname === '/api/notifications/socket-context' && item.authorization === `Bearer ${token}` && item.notificationId === null))
   assert.ok(!JSON.stringify(result.authenticated).includes(token))
   assert.ok(!state.logs.join('\n').includes(token))
+  assert.ok(state.requests.some((item) => item.authorization && /^[0-9a-f-]{36}$/.test(item.requestId)), 'session checks carry a generated UUID request trace')
+})
+
+test('HTTP/DB fixtures: private metrics need exact Bearer, expose bounded gauges and omit all notification identities', async (t) => {
+  const metricsToken = 'FixtureOnlyMetricsToken0123456789AbCd'
+  const state = await fixture(t, { metricsToken })
+  const token = addToken(state)
+  await authenticate(state, token)
+  for (const authorization of [undefined, 'Bearer wrong', 'Basic ' + metricsToken]) {
+    assert.equal((await fetch(state.serviceUrl + '/metrics', { headers: authorization ? { authorization } : {} })).status, 401)
+  }
+  const trace = ID.notification
+  const response = await fetch(state.serviceUrl + '/health/live?private-query=never-log', { headers: { 'x-request-id': trace } })
+  assert.equal(response.headers.get('x-request-id'), trace)
+  const metrics = await fetch(state.serviceUrl + '/metrics', { headers: { authorization: 'Bearer ' + metricsToken } })
+  assert.equal(metrics.status, 200)
+  const body = await metrics.text()
+  assert.match(body, /saas_notification_authenticated_clients\{service="notification-ws"\} 1/)
+  assert.match(body, /saas_notification_pending_hints/); assert.match(body, /saas_notification_listen_up/)
+  assert.match(body, /saas_http_auth_denials_total/)
+  for (const value of [metricsToken, token, ...Object.values(ID), 'private-query']) assert.ok(!body.includes(value))
+  for (const value of [metricsToken, token, 'private-query', ID.user, ID.session]) assert.ok(!state.logs.join('\n').includes(value))
+})
+
+test('HTTP/DB fixtures: polling and WebSocket handshake trace is reused for protected platform session checks', async (t) => {
+  for (const transport of ['polling', 'websocket']) {
+    const state = await fixture(t), token = addToken(state), trace = ID.application
+    const result = await authenticate(state, token, { transport, requestId: trace })
+    assert.equal(result.authenticated.length, 1)
+    assert.equal(state.requests.find((item) => item.authorization)?.requestId, trace)
+    const socket = state.service.io.sockets.sockets.get(result.socket.id)
+    assert.equal(socket.request.headers['x-request-id'], trace)
+  }
+})
+
+test('HTTP/DB fixtures: generated polling handshake response UUID is the same trace used for later authentication', async (t) => {
+  const state = await fixture(t), token = addToken(state)
+  const base = state.serviceUrl + state.config.socketPath + '?EIO=4&transport=polling'
+  const opened = await fetch(base, { headers: { Origin: ORIGIN } })
+  assert.equal(opened.status, 200)
+  const trace = opened.headers.get('x-request-id')
+  assert.match(trace, /^[0-9a-f-]{36}$/)
+  const packet = await opened.text()
+  assert.equal(packet[0], '0')
+  const sid = JSON.parse(packet.slice(1)).sid
+  const headers = { Origin: ORIGIN, 'Content-Type': 'text/plain;charset=UTF-8' }
+  assert.equal((await fetch(base + '&sid=' + sid, { method: 'POST', headers, body: '40' })).status, 200)
+  await until(() => state.service.io.sockets.sockets.size === 1, 'manual actual polling protocol opens a Socket.IO session')
+  assert.equal((await fetch(base + '&sid=' + sid, { method: 'POST', headers,
+    body: '42' + JSON.stringify(['authenticate', { token }]) })).status, 200)
+  await until(() => state.requests.some((item) => item.authorization), 'authentication reaches the protected platform fixture')
+  assert.equal(state.requests.find((item) => item.authorization).requestId, trace)
 })
 
 test('HTTP/DB fixtures: unauthenticated connection times out with the fixed error', async (t) => {
