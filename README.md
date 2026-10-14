@@ -1,6 +1,6 @@
 # notification-ws
 
-独立 Socket.IO 服务用于提示持久通知的新记录。数据库收件箱是权威来源；本服务不接受发布命令、不改变已读状态，也不把 `onNotify` Toast 写入数据库。完整 Phase10 协议见[通知接入方案](../../docs/notification-integration-plan.md)。
+独立 Socket.IO 服务用于提示持久通知的新记录。数据库收件箱是权威来源；本服务不接受发布命令、不改变已读状态，也不把 `onNotify` Toast 写入数据库。完整通知协议见[通知接入方案](../../docs/architecture.md#notifications)。
 
 ## 启动与配置
 
@@ -33,7 +33,7 @@ node --env-file=.env index.ts
 
 工程时间参数不构成消息投递 SLA。来源必须显式包含浏览器实际 origin（包括端口），例如开发站点的 `http://localhost:3000`。没有 Origin 的 Socket.IO 请求也拒绝；健康探针不要求浏览器 Origin。
 
-数据库账号只需连接目标库及读取新通知表，不需要平台 JWT 密钥或通知写入权限。通知表须已完成 Phase10 迁移；就绪探针会查询新归属字段，旧表不能被误报为已就绪。
+数据库账号只需连接目标库及读取新通知表，不需要平台 JWT 密钥或通知写入权限。通知表须已完成通知归属与发布迁移；就绪探针会查询新归属字段，旧表不能被误报为已就绪。
 
 ## 认证与投递
 
@@ -51,7 +51,7 @@ node --env-file=.env index.ts
 
 `GET /health/live` 返回进程存活。`GET /health` 同时检查数据库新 schema 可查询、LISTEN 已建立和平台保护路由可达，全部 UP 才返回 200，否则 503；JSON 的 `checks.database/listen/platform` 分别显示 UP、DOWN 或 UNKNOWN。未带 Bearer 的平台探针必须收到 401，这只证明保护路由存在。
 
-`GET /metrics` 只接受独立监控 Bearer。生产网关拒绝暴露该路由，私有 runner 从同机 loopback 抓取。请求日志为 JSON、路由与指标 labels 使用静态集合，不包含查询、用户／会话 ID、token 或通知内容；合法 UUID `X-Request-Id` 会返回并传递给内部会话验证。完整指标和本地 DOWN／RECOVERED 告警配置见[可观测性文档](../../docs/observability.md)。
+`GET /metrics` 只接受独立监控 Bearer。生产网关拒绝暴露该路由，私有 runner 从同机 loopback 抓取。请求日志为 JSON、路由与指标 labels 使用静态集合，不包含查询、用户／会话 ID、token 或通知内容；合法 UUID `X-Request-Id` 会返回并传递给内部会话验证。完整指标和本地 DOWN／RECOVERED 告警配置见[可观测性文档](../../docs/architecture.md#observability)。
 
 LISTEN 用独立 PostgreSQL Client。断开立即将 listen 标为 DOWN，关闭旧连接并按有上限的退避新建连接，重新成功 LISTEN 后恢复 UP。查询使用独立连接池；就绪探针还会 ping 该条 LISTEN 连接，避免连接池正常却监听链路失效。`pg_stat_activity.application_name` 分别是 `dante-notification-listen` 与 `dante-notification-query`。终止信号会关闭 Socket.IO、timer、HTTP 和数据库连接。
 
@@ -59,7 +59,7 @@ LISTEN 用独立 PostgreSQL Client。断开立即将 listen 标为 DOWN，关闭
 
 ## 网关与开发代理
 
-[Caddy](../../deploy/Caddyfile) 用 `handle /socket.io/*` 保留完整路径反代到 `notification-ws:3003`，自动转发 WebSocket Upgrade。不要使用 `handle_path` 剥掉前缀。微应用公开版本目录的通用静态 CORS 规则不会作用于该路径。
+生产 [Caddy](../../deploy/Caddyfile.production) 用 `handle /socket.io/*` 保留完整路径反代到 `notification-ws:3003`，自动转发 WebSocket Upgrade。不要使用 `handle_path` 剥掉前缀。微应用公开版本目录的通用静态 CORS 规则不会作用于该路径。
 
 [Nginx](../../deploy/nginx.conf) 将 `/socket.io/` 原样代理到 `127.0.0.1:3003`，显式使用 HTTP/1.1、Upgrade/Connection、75 秒读取超时和关闭 buffering；Origin 原样交给服务校验。API/OAuth 继续由平台后端处理。部署替换对应上游地址和 TLS 配置。
 
@@ -89,8 +89,6 @@ $env:NOTIFICATION_E2E_BACKEND_BINARY = (Resolve-Path ../../backend/target/debug/
 node --env-file=../../.env.test --test tests/platform-e2e.mjs
 ```
 
-Linux 设置相同变量为 Linux backend 二进制路径，使用 Node 24 执行。缺少任一配置准确跳过。测试启动 main 执行包含 0022 的全部迁移，在自有空 `.env` 的临时 cwd 传入隔离配置；通过真实 login/context/session-token API 取得两名非 super 用户的 session 和应用 token，不签发假 JWT。覆盖持久发布和幂等、权限及数据授权、四个 user/org/tenant 组合的实时隔离、APP 当前访问权变化、真实 inbox/read/count、WS/LISTEN 离线持久化与恢复、context switch、logout 和 membership 撤销。清理只处理本次创建的数据库、LISTEN 连接与 backend 子进程，公共事件和内存日志检查凭据泄漏。详细步骤见[部署排查](../../docs/notification-operations.md)。
+Linux 设置相同变量为 Linux backend 二进制路径，使用 Node 24 执行。缺少任一配置准确跳过。测试启动 main 执行包含 0022 的全部迁移，在自有空 `.env` 的临时 cwd 传入隔离配置；通过真实 login/context/session-token API 取得两名非 super 用户的 session 和应用 token，不签发假 JWT。覆盖持久发布和幂等、权限及数据授权、四个 user/org/tenant 组合的实时隔离、APP 当前访问权变化、真实 inbox/read/count、WS/LISTEN 离线持久化与恢复、context switch、logout 和 membership 撤销。清理只处理本次创建的数据库、LISTEN 连接与 backend 子进程，公共事件和内存日志检查凭据泄漏。详细步骤见[部署排查](../../docs/architecture.md#notifications)。
 
-2026-10-02 实际平台联合验收在 Linux Node 24.3.0 上通过 9 项（8 场景和总测试），0 跳过、退出码 0；使用最新 backend main 和实际迁移 0022。自有资源清理、日志与公开事件的凭据扫描一并通过。服务协议 71 项、真实 PostgreSQL 5 项、Vite 代理 9 项及 Caddy/Nginx 各 23 项也已通过，详细运行范围见运维文档。
-
-测试不读取生产凭据或输出数据库连接串。以上服务、数据库、实际平台和代理验证分别报告；当前环境没有 Docker daemon，容器实际构建与启动尚未验证。
+测试不读取生产凭据或输出数据库连接串。服务协议 fixture、真实数据库、平台联合和网关验证分别报告；结果以实际运行输出为准，缺少配置时跳过不等于通过。容器构建与启动需在目标环境验证。历史验收统一见[架构文档](../../docs/architecture.md#validation)。
