@@ -13,7 +13,7 @@ npm ci --ignore-scripts
 node --env-file=.env index.ts
 ```
 
-容器构建上下文为本服务目录：`docker build -t dante-notification-ws mini-services/notification-ws`。部署提供必填环境变量，并让网关保留 `/socket.io/` 路径转发 polling 与 WebSocket；宿主使用相同路径。Dockerfile 使用 Node 24 和非 root 用户；没有依赖项目之外的个人开发机文件。
+容器构建上下文为本服务目录：`docker build -t platform-notification-ws mini-services/notification-ws`。部署提供必填环境变量，并让网关保留 `/socket.io/` 路径转发 polling 与 WebSocket；宿主使用相同路径。Dockerfile 使用 Node 24 和非 root 用户；没有依赖项目之外的个人开发机文件。
 
 仓库 Compose 已编排 `notification-ws`，只在容器网络暴露 3003。生产 `PLATFORM_API_BASE_URL` 和浏览器来源必须显式配置精确 HTTPS origin；开发模式仅允许 loopback HTTP，容器 DNS 的 HTTP 不属于此例外。`NOTIFICATION_DATABASE_URL` 可覆盖独立读取账号；通知容器不接收 `JWT_SECRET`。生产设置 `NODE_ENV=production`、独立 `METRICS_TOKEN` 和实际浏览器 origin；测试 CA 通过 `NODE_EXTRA_CA_CERTS` 加载，禁止关闭 TLS 验证。
 
@@ -53,7 +53,7 @@ node --env-file=.env index.ts
 
 `GET /metrics` 只接受独立监控 Bearer。生产网关拒绝暴露该路由，私有 runner 从同机 loopback 抓取。请求日志为 JSON、路由与指标 labels 使用静态集合，不包含查询、用户／会话 ID、token 或通知内容；合法 UUID `X-Request-Id` 会返回并传递给内部会话验证。完整指标和本地 DOWN／RECOVERED 告警配置见[可观测性文档](../../docs/architecture.md#observability)。
 
-LISTEN 用独立 PostgreSQL Client。断开立即将 listen 标为 DOWN，关闭旧连接并按有上限的退避新建连接，重新成功 LISTEN 后恢复 UP。查询使用独立连接池；就绪探针还会 ping 该条 LISTEN 连接，避免连接池正常却监听链路失效。`pg_stat_activity.application_name` 分别是 `dante-notification-listen` 与 `dante-notification-query`。终止信号会关闭 Socket.IO、timer、HTTP 和数据库连接。
+LISTEN 用独立 PostgreSQL Client。断开立即将 listen 标为 DOWN，关闭旧连接并按有上限的退避新建连接，重新成功 LISTEN 后恢复 UP。查询使用独立连接池；就绪探针还会 ping 该条 LISTEN 连接，避免连接池正常却监听链路失效。`pg_stat_activity.application_name` 分别是 `platform-notification-listen` 与 `platform-notification-query`。终止信号会关闭 Socket.IO、timer、HTTP 和数据库连接。
 
 服务不通过不稳定的 `created_at` 水位轮询声称事件重放。断线期间数据库通知仍由平台持久保存，宿主认证或重连成功后补拉数据库列表与未读数，并保留收件数轮询；历史补拉不批量弹 Toast。本地提示队列最多 1000 项，过载提示可丢弃，不能因此重新持久发布或变更幂等键。
 
@@ -74,7 +74,7 @@ npm test
 
 `tests/service.mjs` 使用实际 Socket.IO 客户端、HTTP 平台 fixture 和数据库接口 fixture。它验证实时服务的认证/再验、房间、过期、Origin、HTTP 限制、异步竞争和依赖健康；fixture 不是实际平台权限实现或真实持久 PostgreSQL。
 
-`tests/postgres.mjs` 通过 `NOTIFICATION_TEST_DATABASE_URL` 或 `TEST_DATABASE_URL` 显式启用；没有这些变量则准确跳过。账号需有创建独立测试库权限。测试只创建随机 `notification_ws_test_<UUID>` 数据库，在其中建立最小 SQL fixture，验证真实事务行、NOTIFY、查询归属与 LISTEN 断开/恢复；只终止该库标记 `dante-notification-listen` 的唯一连接，完成后删除自有测试库。平台认证仍是 HTTP fixture，这不代替实际迁移、发布授权和幂等 API 验收。
+`tests/postgres.mjs` 通过 `NOTIFICATION_TEST_DATABASE_URL` 或 `TEST_DATABASE_URL` 显式启用；没有这些变量则准确跳过。账号需有创建独立测试库权限。测试只创建随机 `notification_ws_test_<UUID>` 数据库，在其中建立最小 SQL fixture，验证真实事务行、NOTIFY、查询归属与 LISTEN 断开/恢复；只终止该库标记 `platform-notification-listen` 的唯一连接，完成后删除自有测试库。平台认证仍是 HTTP fixture，这不代替实际迁移、发布授权和幂等 API 验收。
 
 如使用仓库根目录 Git 忽略的 `.env.test`，从本服务目录执行：
 
@@ -85,7 +85,7 @@ node --env-file=../../.env.test --test tests/postgres.mjs
 `tests/platform-e2e.mjs` 使用编译好的真实 backend main、完整实际迁移/种子、真实 PostgreSQL 和本 Socket.IO 服务。显式设置 `NOTIFICATION_E2E_BACKEND_BINARY` 为当前平台 backend main 的绝对路径，并提供上述测试数据库 URL 后运行：
 
 ```powershell
-$env:NOTIFICATION_E2E_BACKEND_BINARY = (Resolve-Path ../../backend/target/debug/dante-cloud-backend.exe).Path
+$env:NOTIFICATION_E2E_BACKEND_BINARY = (Resolve-Path ../../backend/target/debug/saas-platform-backend.exe).Path
 node --env-file=../../.env.test --test tests/platform-e2e.mjs
 ```
 

@@ -14,7 +14,7 @@ import { createNotificationService } from '../service.mjs'
 const adminUrl = process.env.NOTIFICATION_TEST_DATABASE_URL ?? process.env.TEST_DATABASE_URL
 const DATABASE_PREFIX = 'notification_ws_test_'
 const ORIGIN = 'https://postgres-notification-fixture.example.test'
-const LISTENER_APPLICATION = 'dante-notification-listen'
+const LISTENER_APPLICATION = 'platform-notification-listen'
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function safeDatabaseError(error, operation) {

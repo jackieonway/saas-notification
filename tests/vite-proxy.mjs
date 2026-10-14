@@ -17,7 +17,7 @@ const ORIGIN = 'https://vite-socket-fixture.example.test'
 const SOCKET_PATH = '/socket.io/'
 const QUERY_MARKER = 'version/1.0.0?标签=传输'
 const TARGET_VARIABLE = 'NOTIFICATION_DEV_PROXY_TARGET'
-const TEMP_PREFIX = 'dante-notification-vite-proxy-test-'
+const TEMP_PREFIX = 'platform-notification-vite-proxy-test-'
 const tempBase = realpathSync(os.tmpdir())
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))

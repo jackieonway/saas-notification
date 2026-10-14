@@ -4,7 +4,7 @@ const { Client, Pool } = pg
 const CHANNEL = 'new_notification'
 
 export function createPostgresStore(config, logger = console) {
-  const pool = new Pool({ connectionString: config.databaseUrl, application_name: 'dante-notification-query', max: 4, connectionTimeoutMillis: 2000, query_timeout: 5000 })
+  const pool = new Pool({ connectionString: config.databaseUrl, application_name: 'platform-notification-query', max: 4, connectionTimeoutMillis: 2000, query_timeout: 5000 })
   let listener = null
   let listenerReady = false
   let listenerFailure = () => {}
@@ -27,7 +27,7 @@ export function createPostgresStore(config, logger = console) {
   async function connect() {
     if (stopped) return
     const attempt = ++generation
-    const client = new Client({ connectionString: config.databaseUrl, application_name: 'dante-notification-listen', connectionTimeoutMillis: 2000, query_timeout: 2000, keepAlive: true, keepAliveInitialDelayMillis: 10000 })
+    const client = new Client({ connectionString: config.databaseUrl, application_name: 'platform-notification-listen', connectionTimeoutMillis: 2000, query_timeout: 2000, keepAlive: true, keepAliveInitialDelayMillis: 10000 })
     listener = client
     listenerReady = false
     let lost = false

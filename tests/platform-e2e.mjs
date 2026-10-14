@@ -18,7 +18,7 @@ import { createNotificationService } from '../service.mjs'
 const adminUrl = process.env.NOTIFICATION_TEST_DATABASE_URL ?? process.env.TEST_DATABASE_URL
 const binaryArgument = process.env.NOTIFICATION_E2E_BACKEND_BINARY
 const DB_PREFIX = 'notification_platform_e2e_'
-const TEMP_PREFIX = 'dante-notification-platform-e2e-'
+const TEMP_PREFIX = 'platform-notification-platform-e2e-'
 const APP_A = 'p10-e2e-app-a'
 const APP_B = 'p10-e2e-app-b'
 const PUBLISHER = 'p10-e2e-publisher'
@@ -459,12 +459,12 @@ test('opt-in actual backend + PostgreSQL + Socket.IO notification publication an
   })
 
   await t.test('actual publication during owned LISTEN loss persists and reconnect receives the next new notification', async () => {
-    const current = await query(f.admin, "SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='dante-notification-listen' AND backend_type='client backend'", [f.databaseName])
+    const current = await query(f.admin, "SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='platform-notification-listen' AND backend_type='client backend'", [f.databaseName])
     assert.equal(current.rows.length, 1)
     const pid = current.rows[0].pid
     assert.ok(Number.isSafeInteger(pid) && pid > 0)
     const start = f.transitions.length
-    const stopped = await query(f.admin, "SELECT pg_terminate_backend(pid) AS stopped FROM pg_stat_activity WHERE datname=$1 AND application_name='dante-notification-listen' AND pid=$2", [f.databaseName, pid])
+    const stopped = await query(f.admin, "SELECT pg_terminate_backend(pid) AS stopped FROM pg_stat_activity WHERE datname=$1 AND application_name='platform-notification-listen' AND pid=$2", [f.databaseName, pid])
     assert.deepEqual(stopped.rows, [{ stopped: true }])
     await until(() => f.transitions.slice(start).includes(false), 'only the owned listener loss must report DOWN')
     assert.equal((await f.service.probeHealth()).checks.listen, 'DOWN')
@@ -474,7 +474,7 @@ test('opt-in actual backend + PostgreSQL + Socket.IO notification publication an
     assert.ok((await f.ok('GET', '/api/notifications?size=200', sessionA.token)).records.some((row) => row.id === offline.rows[0].id))
     await until(async () => (await f.service.probeHealth()).status === 'UP', 'real PostgreSQL listener must reconnect', 25000)
     assert.ok(f.transitions.slice(start).includes(true))
-    const nextPid = await query(f.admin, "SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='dante-notification-listen'", [f.databaseName])
+    const nextPid = await query(f.admin, "SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='platform-notification-listen'", [f.databaseName])
     assert.equal(nextPid.rows.length, 1)
     assert.notEqual(nextPid.rows[0].pid, pid)
     const next = await f.publish(APP_B, tokenB, f.body(APP_B, 'after-listen-reconnect', userTarget))
