@@ -20,4 +20,4 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: docker build -t saas-notification:ci .
+      - run: docker build --build-arg SOURCE_REVISION="$GITHUB_SHA" -t saas-notification:ci .
