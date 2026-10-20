@@ -1,4 +1,12 @@
-node_modules
-tests
-.env*
-*.log
+# The runtime is exclusively Rust. Test drivers and private configuration never
+# enter the image context, including old JavaScript implementation files.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+**/.env*
+**/*.pem
+**/*.key
+**/target
+**/node_modules

@@ -3,18 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Scoped real-time notification hints with platform session validation and PostgreSQL LISTEN",
+  "description": "Node test drivers for the standalone Rust notification service",
   "scripts": {
-    "start": "node index.ts",
-    "dev": "node --watch index.ts",
-    "test": "node --test tests/*.mjs"
+    "test": "node --test --test-concurrency=1 tests/rust-platform-e2e.mjs tests/rust-scheduler.mjs tests/rust-boundaries.mjs tests/rust-auth-races.mjs",
+    "test:unit": "cargo test --locked",
+    "test:integration": "node --test --test-concurrency=1 tests/rust-platform-e2e.mjs tests/rust-scheduler.mjs tests/rust-boundaries.mjs tests/rust-auth-races.mjs",
+    "test:browser": "node --test tests/rust-browser.mjs"
   },
   "engines": { "node": ">=24" },
-  "dependencies": {
-    "pg": "^8.16.3",
-    "socket.io": "^4.8.4"
-  },
   "devDependencies": {
+    "pg": "^8.16.3",
     "socket.io-client": "^4.8.4"
   }
 }

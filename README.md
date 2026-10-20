@@ -1,94 +1,83 @@
-# notification-ws
+# Rust notification-ws
 
-独立 Socket.IO 服务用于提示持久通知的新记录。数据库收件箱是权威来源；本服务不接受发布命令、不改变已读状态，也不把 `onNotify` Toast 写入数据库。完整通知协议见[通知接入方案](../../docs/architecture.md#notifications)。
+本服务以Socket.IO提示已落库通知的新记录；PostgreSQL收件箱是事实来源。提示丢失、过载或断线不重新发布、不改变已读状态或幂等键。独立Cargo crate/lock使用socketioxide0.18.7/engineioxide0.17.7，保持当前4.8.4客户端及notification1.0 DTO。旧Node后台与启动文件已移除，npm仅提供PG/客户端测试驱动。
 
-## 启动与配置
+## 启动与部署
 
-正式运行使用已验证的标准 Node 24 和纯 JavaScript 依赖。服务不读取 backend `.env`、不持有 `JWT_SECRET`，平台 session 身份完全通过内部 HTTP 校验取得。
+固定Rust1.97.0；在进程环境中显式设置专用只读DATABASE_URL、PLATFORM_API_BASE_URL、NOTIFICATION_ALLOWED_ORIGINS及METRICS_TOKEN。程序不加载平台.env，并拒绝JWT_SECRET。
 
-```powershell
-cd mini-services/notification-ws
-npm ci --ignore-scripts
-# 将 config.env.example 复制为 Git 忽略的 .env，并替换配置占位。
-node --env-file=.env index.ts
+```sh
+cargo run --locked --manifest-path mini-services/notification-ws/Cargo.toml --target-dir target/notification-ws
 ```
 
-容器构建上下文为本服务目录：`docker build -t platform-notification-ws mini-services/notification-ws`。部署提供必填环境变量，并让网关保留 `/socket.io/` 路径转发 polling 与 WebSocket；宿主使用相同路径。Dockerfile 使用 Node 24 和非 root 用户；没有依赖项目之外的个人开发机文件。
+根开发调度支持 `node scripts/dev.mjs --apps host --with-notifications`，等待 `/health/ready`，首次编译可增大 `--timeout-ms`；通知子进程移除JWT_SECRET，并将NOTIFICATION_DATABASE_URL/NOTIFICATION_METRICS_TOKEN映射为专用配置。
 
-仓库 Compose 已编排 `notification-ws`，只在容器网络暴露 3003。生产 `PLATFORM_API_BASE_URL` 和浏览器来源必须显式配置精确 HTTPS origin；开发模式仅允许 loopback HTTP，容器 DNS 的 HTTP 不属于此例外。`NOTIFICATION_DATABASE_URL` 可覆盖独立读取账号；通知容器不接收 `JWT_SECRET`。生产设置 `NODE_ENV=production`、独立 `METRICS_TOKEN` 和实际浏览器 origin；测试 CA 通过 `NODE_EXTRA_CA_CERTS` 加载，禁止关闭 TLS 验证。
+生产采用[正式通知Compose](../../deploy/compose.notification.yml)与[环境模板](../../deploy/compose.notification.env.example)，按本目录Dockerfile独立构建。镜像非root10003、只读根文件系统、私网3003，无宿主端口、源码或Docker socket挂载。NOTIFICATION_IMAGE使用固定版本/digest；legacy override已移出通知。入口先有HTTPS，再显式将/socket.io/路由到notification-ws:3003；入口不能依赖通知ready形成探针循环。私有CA使用[只读CA overlay](../../deploy/compose.notification-ca.yml)，保持正常TLS校验。
 
-| 变量 | 默认或范围 | 用途 |
-| --- | --- | --- |
-| `DATABASE_URL` | 必填 PostgreSQL URL | 查询通知与独立 LISTEN 连接 |
-| `PLATFORM_API_BASE_URL` | 必填精确 HTTPS origin | 无路径、query 或凭据；开发额外允许 loopback HTTP |
-| `NODE_ENV` / `METRICS_TOKEN` | 生产必须 `production` 与独立随机 token | 私有 `/metrics` 的精确 Bearer；至少 32 字符，不能是占位值 |
-| `NOTIFICATION_ALLOWED_ORIGINS` | 必填，逗号分隔精确 origin | 同时约束 polling、WebSocket 握手和升级；不支持 `*` 或 `null` |
-| `NOTIFICATION_HOST` / `NOTIFICATION_PORT` | `0.0.0.0` / `3003` | HTTP/Socket.IO 监听 |
-| `NOTIFICATION_SOCKET_PATH` | `/socket.io/` | 明确专用路径，以 `/` 结尾；不允许根路径 |
-| `NOTIFICATION_AUTH_TIMEOUT_MS` | `2000`，100–10000 | 单次平台请求及响应体读取超时 |
-| `NOTIFICATION_AUTH_RECHECK_MS` | `30000`，1000–300000 | 空闲认证连接重新验证 |
-| `NOTIFICATION_AUTH_WAIT_MS` | `10000`，100–60000 | 未认证连接等待上限 |
-| `NOTIFICATION_HEALTH_PROBE_MS` | `5000`，1000–60000 | 依赖探针间隔 |
-| `NOTIFICATION_DATABASE_RETRY_MS` | `1000`，100–30000 | LISTEN 重连初始间隔，退避最多 30 秒 |
-
-工程时间参数不构成消息投递 SLA。来源必须显式包含浏览器实际 origin（包括端口），例如开发站点的 `http://localhost:3000`。没有 Origin 的 Socket.IO 请求也拒绝；健康探针不要求浏览器 Origin。
-
-数据库账号只需连接目标库及读取新通知表，不需要平台 JWT 密钥或通知写入权限。通知表须已完成通知归属与发布迁移；就绪探针会查询新归属字段，旧表不能被误报为已就绪。
-
-## 认证与投递
-
-1. 客户端连接 `/socket.io/` 后仅能初次发送 `authenticate`，严格数据为 `{ token: string }`。
-2. 服务捕获该 Bearer，调用 `GET /api/notifications/socket-context`。平台完整验证 `typ=session`、数据库 session、当前成员关系和租户/组织有效状态。服务不解码 JWT，也不相信客户端传入的 user/tenant/org。
-3. 成功后加入 `tenant:<tenantId>:org:<organizationId>:user:<userId>` 房间，并发送 `authenticated`：`contractVersion/userId/tenantId/organizationId/expiresAt`，不含 token 或 sessionId。
-4. `new_notification` 仅接受 `{id,tenantId,organizationId,userId}` 提示。按四个字段查数据库，APP/SYSTEM 完整归属行才可发送；LEGACY、未知类型及伪造/不一致载荷不广播。
-5. 每次投递到某 socket 前，再调用 `socket-context?notificationId=<已核对通知ID>`。平台验证归属；APP 行还要求当前应用在该租户及组织可访问。返回身份与最初的 user/tenant/org/sessionId 必须一致。
-6. 通知特定 403/404 只跳过该通知，保留其它合法应用通知；401、到期或身份/sessionId 变化发送 `unauthorized` 后断开。网络、5xx、异常协议或响应超过 4 KiB 不发送当前事件；初次或定时校验不能确认时断开。
-7. 初次设置到期 timer，后续平台验证只能缩短已知期限；定时再验清理没有新事件的失效会话。再次 authenticate（包括试图换身份）拒绝并断开。
-
-内部请求固定指向配置的平台 origin，不跟随 redirect，不记录连接串、Bearer、响应原文或签名密钥。通知事件只有公开协议字段：`contractVersion/id/userId/tenantId/organizationId/applicationId/publicationId/type/title/content/link/createdAt`。
-
-## 健康与断线恢复
-
-`GET /health/live` 返回进程存活。`GET /health` 同时检查数据库新 schema 可查询、LISTEN 已建立和平台保护路由可达，全部 UP 才返回 200，否则 503；JSON 的 `checks.database/listen/platform` 分别显示 UP、DOWN 或 UNKNOWN。未带 Bearer 的平台探针必须收到 401，这只证明保护路由存在。
-
-`GET /metrics` 只接受独立监控 Bearer。生产网关拒绝暴露该路由，私有 runner 从同机 loopback 抓取。请求日志为 JSON、路由与指标 labels 使用静态集合，不包含查询、用户／会话 ID、token 或通知内容；合法 UUID `X-Request-Id` 会返回并传递给内部会话验证。完整指标和本地 DOWN／RECOVERED 告警配置见[可观测性文档](../../docs/architecture.md#observability)。
-
-LISTEN 用独立 PostgreSQL Client。断开立即将 listen 标为 DOWN，关闭旧连接并按有上限的退避新建连接，重新成功 LISTEN 后恢复 UP。查询使用独立连接池；就绪探针还会 ping 该条 LISTEN 连接，避免连接池正常却监听链路失效。`pg_stat_activity.application_name` 分别是 `platform-notification-listen` 与 `platform-notification-query`。终止信号会关闭 Socket.IO、timer、HTTP 和数据库连接。
-
-服务不通过不稳定的 `created_at` 水位轮询声称事件重放。断线期间数据库通知仍由平台持久保存，宿主认证或重连成功后补拉数据库列表与未读数，并保留收件数轮询；历史补拉不批量弹 Toast。本地提示队列最多 1000 项，过载提示可丢弃，不能因此重新持久发布或变更幂等键。
-
-## 网关与开发代理
-
-生产 [Caddy](../../deploy/Caddyfile.production) 用 `handle /socket.io/*` 保留完整路径反代到 `notification-ws:3003`，自动转发 WebSocket Upgrade。不要使用 `handle_path` 剥掉前缀。微应用公开版本目录的通用静态 CORS 规则不会作用于该路径。
-
-[Nginx](../../deploy/nginx.conf) 将 `/socket.io/` 原样代理到 `127.0.0.1:3003`，显式使用 HTTP/1.1、Upgrade/Connection、75 秒读取超时和关闭 buffering；Origin 原样交给服务校验。API/OAuth 继续由平台后端处理。部署替换对应上游地址和 TLS 配置。
-
-[Vite](../../frontend/vite.config.ts) 仅代理 `/socket.io`，默认目标 `http://127.0.0.1:3003`，可用 `NOTIFICATION_DEV_PROXY_TARGET` 指向开发服务；去掉旧根路径 bypass 与 `XTransformPort`。这不会代理宿主路由或 HMR。默认路径在服务、宿主和网关一致；若自行改路径，三处必须同步。
-
-## 验证范围
-
-```powershell
-cd mini-services/notification-ws
-npm test
+```sh
+docker compose --env-file /secure/platform.env --env-file /secure/notification.env -f docker-compose.yml -f deploy/compose.notification.yml --profile notification config --quiet
 ```
 
-`tests/service.mjs` 使用实际 Socket.IO 客户端、HTTP 平台 fixture 和数据库接口 fixture。它验证实时服务的认证/再验、房间、过期、Origin、HTTP 限制、异步竞争和依赖健康；fixture 不是实际平台权限实现或真实持久 PostgreSQL。
+## 配置
 
-`tests/postgres.mjs` 通过 `NOTIFICATION_TEST_DATABASE_URL` 或 `TEST_DATABASE_URL` 显式启用；没有这些变量则准确跳过。账号需有创建独立测试库权限。测试只创建随机 `notification_ws_test_<UUID>` 数据库，在其中建立最小 SQL fixture，验证真实事务行、NOTIFY、查询归属与 LISTEN 断开/恢复；只终止该库标记 `platform-notification-listen` 的唯一连接，完成后删除自有测试库。平台认证仍是 HTTP fixture，这不代替实际迁移、发布授权和幂等 API 验收。
+| 名称 | 默认值与边界 |
+| --- | --- |
+| DATABASE_URL | 必填PostgreSQL URL，专用读取/LISTEN身份 |
+| PLATFORM_API_BASE_URL | 必填精确HTTPS origin；开发额外允许回环HTTP |
+| NOTIFICATION_ALLOWED_ORIGINS | 必填精确origin，最多32个；缺失/null/*拒绝 |
+| NOTIFICATION_ENV | development；production/development/test，兼容NODE_ENV |
+| METRICS_TOKEN | production必填，32–256随机URL安全字符，独立精确Bearer |
+| NOTIFICATION_PLATFORM_CA_FILE | 可选追加PEM CA，最大1MiB，不关闭验证 |
+| NOTIFICATION_HOST / NOTIFICATION_PORT | 0.0.0.0 / 3003；端口0仅开发测试 |
+| NOTIFICATION_SOCKET_PATH | /socket.io/，明确非根路径且末尾/；网关/宿主同步 |
+| NOTIFICATION_AUTH_TIMEOUT_MS | 2000，100–10000；含HTTP许可等待、连接和body总deadline |
+| NOTIFICATION_AUTH_WAIT_MS | 10000，100–60000；首次事件认证等待 |
+| NOTIFICATION_AUTH_RECHECK_MS | 30000，1000–300000；另加每连接0–20%复验抖动 |
+| NOTIFICATION_HEALTH_PROBE_MS | 5000，1000–60000 |
+| NOTIFICATION_DATABASE_RETRY_MS | 1000，100–30000；指数退避/80–120%抖动，最大30s |
+| NOTIFICATION_MAX_CONNECTIONS | 256，1–4096；Engine及namespace准入上限C |
+| NOTIFICATION_MAX_PARTITIONS | 128，1–4096 |
+| NOTIFICATION_PER_PARTITION_QUEUE | 32，1–4096，不大于全局pending上限 |
+| NOTIFICATION_TOTAL_QUEUE | 1000，1–65536 |
+| NOTIFICATION_MAX_INFLIGHT | 8，1–256；同时处理的提示分区 |
+| NOTIFICATION_VALIDATION_CONCURRENCY | 16，1–256且不大于C；所有平台验证共用 |
+| NOTIFICATION_SHUTDOWN_ON_STDIN | 默认关闭；仅测试显式1时EOF停止，生产使用信号 |
 
-如使用仓库根目录 Git 忽略的 `.env.test`，从本服务目录执行：
+## 身份与调度
 
-```powershell
-node --env-file=../../.env.test --test tests/postgres.mjs
+连接后仅接受一次严格JSON对象 `authenticate {token}`；数组、额外字段、非法/超长token拒绝。第一次尝试在future调度前按收包顺序消费，重复事件立即拒绝并退役，迟到结果不能复活连接。平台Bearer真实调用 `GET /api/notifications/socket-context`，绑定user/tenant/org/sessionId；公开authenticated只含contractVersion/userId/tenantId/organizationId/expiresAt。
+
+平台HTTP禁止redirect/环境代理，正常rustls校验，整个交换限4096字节JSON及统一deadline。通知服务不解码JWT签名，也不接受浏览器自报归属。`new_notification`严格四UUID，SQL按id和完整归属只读APP/SYSTEM；实际逐socket投递前带notificationId实时复验。APP特定403/404只跳当前提示；投递网络/5xx/异常协议也停止当前提示。401、身份/session变化或到期断开；初次/周期无法确认则fail closed。已知expiresAt只能缩短，独立watch不被慢HTTP延迟。
+
+按user/tenant/org分区FIFO，同一key一个handler、ready分区公平轮转；慢key不会占住其他key的空闲worker。pending最多total_queue，active最多max_inflight，驻留提示上界为两者之和；过载只丢提示，数据库收件箱保留。平台HTTP许可有界、query池4连接、独立LISTEN池1连接；每连接两个watch，Engine上限C、TCP上限4C+16，Socket.IO buffers32、payload/WS/frame8192字节。退出丢pending并取消/等待active，不写收件箱；Engine关闭与100ms刷新后的全TCP撤销共同await，idle TCP和未完成HTTP请求头也被回收。
+
+拒绝保持 `unauthorized {code:"SESSION_INVALID",message:"实时通知会话已失效"}` 和namespace断开；100ms flush后还会撤销该Engine当前TCP，阻止不合作raw peer忽略41。HTTP keepalive按当前Engine所有权处理，旧连接不能误关复用于其他会话或health的TCP。namespace、物理IO关闭与Engine内部状态回收分别核验；polling旧Engine元数据可能等待库心跳/连接deadline回收，其总量仍受C限制。
+
+周期失效候选窗口由1.2×recheck+authTimeout+flush及实际调度决定；默认参数不是SLA，不承诺成员变化瞬间物理断连。具体测试配置和实测时长见[Phase23证据](../../docs/validation/phase-23.md)。
+
+## 数据库、健康与观测
+
+[notification-role.sql](../../deploy/notification-role.sql)提供离线管理员配置模板：只授目标库CONNECT、schema USAGE及notifications所需12列SELECT，不授users或业务写入；默认只读事务。服务不建表、不迁移、不发布。application_name分别为platform-notification-query与platform-notification-listen，URL参数不能覆盖标记。
+
+`/health/live`仅表示进程可响应；`/health`和`/health/ready`要求database/listen/platform全UP，否则503。实际检查通知schema和同一LISTEN连接，平台无Bearer探针须真实收到401。监听丢失先DOWN、丢旧连接、按有界抖动退避重建；不以pool正常替代LISTEN正常。
+
+`/metrics`仅接受独立Bearer，公开网关继续拒绝。固定series无用户/组织/session/token标签，包含clients、authenticated_clients、pending_hints、partitions、active_partitions、各limit、validation_inflight/high_water、validation耗时、queue_wait sum/max、投递/拒绝/丢弃/重连计数。指标不替代持久收件箱完整性验证。
+
+## 切流与回退
+
+先隔离验证目标镜像和只读角色，核对固定版本/CA/路由/origin，再排空旧Node通知并用其原部署清单精确停止该服务，启用Rust profile同一路径。Compose合并不会自动停止原Node容器；不要用泛化remove-orphans误及其他服务。旧宿主静态资源在升级窗口保留，支持既有1.0 wire和重连再认证；继续实时失权，不放宽sandbox、origin或token类型。
+
+宿主认证/重连后真实HTTP补拉列表、计数、偏好，历史不弹Toast。`[websocket,polling]`本身不保证初始WS失败自动polling回退，HTTP补拉也不是该能力。服务不改schema，回退到保留兼容Rust镜像或关闭实时路由均不改变持久通知；不可为补提示重新发布或绕过授权。外部registry推送、目标生产部署和正式容量承诺另需环境与执行请求。
+
+## 验证入口
+
+```sh
+cargo test --locked --manifest-path mini-services/notification-ws/Cargo.toml --all-targets
+node scripts/ci/notification.mjs --run-tests --out-dir /absolute/new-report
+node scripts/ci/notification.mjs --run-tests --out-dir /absolute/new-browser-report --browser chromium
+node scripts/ci/notification-image.mjs --out-dir /absolute/new-image-report --source-revision FULL_GIT_SHA
 ```
 
-`tests/platform-e2e.mjs` 使用编译好的真实 backend main、完整实际迁移/种子、真实 PostgreSQL 和本 Socket.IO 服务。显式设置 `NOTIFICATION_E2E_BACKEND_BINARY` 为当前平台 backend main 的绝对路径，并提供上述测试数据库 URL 后运行：
+联合driver只接受owned PG；缺配置、零测试、skip或报告缺失都失败。真实平台main/完整迁移seed/实际session/app token、Rust通知与只延迟转发真实平台的Rust proxy共同验证持久发布、撤权、恢复、预算和边界；浏览器使用两个实际宿主页验证共享切组织、旧HTTP隔离和重连补拉。Node仅是PG/API驱动、Vite及浏览器工具。
 
-```powershell
-$env:NOTIFICATION_E2E_BACKEND_BINARY = (Resolve-Path ../../backend/target/debug/saas-platform-backend.exe).Path
-node --env-file=../../.env.test --test tests/platform-e2e.mjs
-```
-
-Linux 设置相同变量为 Linux backend 二进制路径，使用 Node 24 执行。缺少任一配置准确跳过。测试启动 main 执行包含 0022 的全部迁移，在自有空 `.env` 的临时 cwd 传入隔离配置；通过真实 login/context/session-token API 取得两名非 super 用户的 session 和应用 token，不签发假 JWT。覆盖持久发布和幂等、权限及数据授权、四个 user/org/tenant 组合的实时隔离、APP 当前访问权变化、真实 inbox/read/count、WS/LISTEN 离线持久化与恢复、context switch、logout 和 membership 撤销。清理只处理本次创建的数据库、LISTEN 连接与 backend 子进程，公共事件和内存日志检查凭据泄漏。详细步骤见[部署排查](../../docs/architecture.md#notifications)。
-
-测试不读取生产凭据或输出数据库连接串。服务协议 fixture、真实数据库、平台联合和网关验证分别报告；结果以实际运行输出为准，缺少配置时跳过不等于通过。容器构建与启动需在目标环境验证。历史验收统一见[架构文档](../../docs/architecture.md#validation)。
+镜像driver独立证明非root/只读/无Node、默认closed stdin仍存活、依赖DOWN时live200/ready503、私有metrics、SIGTERM和源码对应；它不替代真实平台PG联合。旧Node fixture退役，历史记录保留其原语义。当前实际结果、失败/环境记录、源码摘要和清理见[Phase23证据](../../docs/validation/phase-23.md)。
