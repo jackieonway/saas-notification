@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    identifiers,
     metrics::{Health, Metrics},
     platform::{Platform, ValidationError},
     protocol::{authentication_token, Context, Hint, Identity},
@@ -148,9 +149,7 @@ impl Shared {
             return false;
         }
         if let Some(previous) = bound.as_ref() {
-            if previous.context.identity != context.identity
-                || previous.context.session_id != context.session_id
-            {
+            if !context.same_binding(&previous.context) {
                 return false;
             }
             context.expires_at = context.expires_at.min(previous.context.expires_at);
@@ -293,7 +292,7 @@ impl Shared {
         if self.cancel.is_cancelled() {
             return;
         }
-        let event = match self.store.get(&hint).await {
+        let delivery = match self.store.get(&hint).await {
             Ok(Some(event)) => event,
             Ok(None) => return,
             Err(_) => {
@@ -302,9 +301,10 @@ impl Shared {
                 return;
             }
         };
-        if event.identity() != identity {
+        if delivery.recipient != identity {
             return;
         }
+        let event = delivery.notification;
         let connections: Vec<_> = self
             .connections
             .lock()
@@ -345,7 +345,7 @@ async fn connected(socket: SocketRef, shared: Shared) {
         .req_parts()
         .extensions
         .get::<RequestId>()
-        .map_or_else(Uuid::new_v4, |id| id.0);
+        .map_or_else(identifiers::new_id, |id| id.0);
     if let Some(engine) = socket.req_parts().extensions.get::<EngineAdmission>() {
         if let Ok(mut engines) = shared.engines.lock() {
             engines.retain(|_, engine| engine.strong_count() > 0);
@@ -421,12 +421,7 @@ async fn guard(State(shared): State<Shared>, mut request: Request, next: Next) -
     if let Some(ConnectInfo(control)) = request.extensions().get::<ConnectInfo<Control>>() {
         control.detach();
     }
-    let id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let id = request_id(request.headers());
     request.extensions_mut().insert(RequestId(id));
     let path = request.uri().path();
     let prefix = shared.config.socket_path.trim_end_matches('/');
@@ -559,6 +554,20 @@ async fn guard(State(shared): State<Shared>, mut request: Request, next: Next) -
         response.headers_mut().insert("x-request-id", id);
     }
     response
+}
+
+// Invalid, legacy or repeated external correlation headers receive a fresh v7;
+// they never become trusted identity or random backoff input.
+fn request_id(headers: &axum::http::HeaderMap) -> Uuid {
+    let mut values = headers.get_all("x-request-id").iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => value
+            .to_str()
+            .ok()
+            .and_then(identifiers::parse)
+            .unwrap_or_else(identifiers::new_id),
+        _ => identifiers::new_id(),
+    }
 }
 
 fn existing_sid(query: Option<&str>) -> Result<bool, ()> {
@@ -778,6 +787,29 @@ pub async fn run_from_env() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn request_headers_keep_only_one_valid_v7_or_receive_a_fresh_id() {
+        let valid = "01962345-6789-7abc-8def-0123456789ab";
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(identifiers::valid(request_id(&headers)));
+        headers.insert("x-request-id", HeaderValue::from_static(valid));
+        assert_eq!(request_id(&headers).to_string(), valid);
+        headers.append("x-request-id", HeaderValue::from_static(valid));
+        let regenerated = request_id(&headers);
+        assert!(identifiers::valid(regenerated));
+        assert_ne!(regenerated.to_string(), valid);
+        for invalid in [
+            "11111111-2222-4333-8444-555555555555", // Explicit legacy v4 negative.
+            "00000000-0000-0000-0000-000000000000",
+            "01962345-6789-7abc-cdef-0123456789ab",
+            "external-trace",
+        ] {
+            headers.clear();
+            headers.insert("x-request-id", HeaderValue::from_static(invalid));
+            assert!(identifiers::valid(request_id(&headers)));
+            assert_ne!(request_id(&headers).to_string(), invalid);
+        }
+    }
     #[test]
     fn invalid_or_duplicate_sid_cannot_skip_engine_admission() {
         assert_eq!(existing_sid(Some("EIO=4&transport=polling")), Ok(false));

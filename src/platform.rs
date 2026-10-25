@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    identifiers,
     metrics::Metrics,
     protocol::{Context, ContextError},
 };
@@ -62,7 +63,7 @@ impl Platform {
         let client = builder.build().map_err(|_| ValidationError::Unavailable)?;
         let context_url = config
             .platform_api_base_url
-            .join("/api/notifications/socket-context")
+            .join("/api/internal/notifications/context-proof")
             .map_err(|_| ValidationError::Contract)?;
         Ok(Self {
             client,
@@ -84,6 +85,11 @@ impl Platform {
             .validation_count
             .fetch_add(1, Ordering::Relaxed);
         let result = tokio::time::timeout(self.deadline, async {
+            if notification_id.is_some_and(|id| !identifiers::valid(id))
+                || request_id.is_some_and(|id| !identifiers::valid(id))
+            {
+                return Err(ValidationError::Contract);
+            }
             let _permit = self
                 .permits
                 .acquire()

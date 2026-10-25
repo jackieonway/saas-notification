@@ -19,9 +19,13 @@ docker build --build-arg SOURCE_REVISION=<完整提交SHA> -t saas-notification:
 
 先在平台完成通知表和触发器迁移，再由数据库管理员审阅 [notification-role.sql](../../saas-plateform/backend/notification-role.sql) 并在目标数据库执行。脚本建立或检查专用 `notification_ws` 非特权角色、只读事务默认值和通知所需列的 SELECT 权限；密码通过独立秘密管理渠道配置。脚本不会在通知服务启动时自动执行。
 
-查询需要 `notifications` 的通知 ID、接收用户/租户/组织、来源、应用/发布 ID、类型、标题、内容、链接与创建时间。LISTEN 使用 PostgreSQL 通道 `new_notification`；PostgreSQL 没有单独的 LISTEN GRANT。角色不应拥有平台用户表、写入、角色成员关系或管理权限，管理员还需审计 PUBLIC 继承权限。
+查询需要 `notifications` 的通知 ID、接收用户/租户/组织、`recipient_membership_id`、`recipient_member_type`、`recipient_identity_version`、来源、应用/发布 ID、类型、标题、内容、链接与创建时间。本次成员隔离升级须先完成平台通知迁移，再执行更新后的列级 GRANT；仅升级 binary 或沿用旧列权限不能完成部署。LISTEN 使用 PostgreSQL 通道 `new_notification`；PostgreSQL 没有单独的 LISTEN GRANT。
+
+通知账号不需要、也不应获得 `users` 或 `memberships` 的 SELECT；成员和账号的实时权威状态通过平台内部 HTTP 证明获取。账号不得拥有写入、角色成员关系或管理权限，管理员还需审计 PUBLIC 继承权限。不要授予整表 SELECT 或身份表权限来绕过缺少 recipient 列权限的问题。
 
 服务使用最多 4 个查询池连接和独立 LISTEN 连接，连接应用名分别为 `platform-notification-query`、`platform-notification-listen`。连接失败时会重试并保持未就绪。不要用平台写账号替换通知账号来掩盖权限或迁移问题。
+
+旧通知中缺少 recipient 成员、类型或身份版本的 NULL 行只保留归档；本次新库身份功能没有历史通知回填任务。通知服务不会根据当前 `user_id / organization_id` 为旧行补绑，也不签发、刷新令牌或执行平台迁移。首版客户通知保持关闭，缺省广播只展开到有效员工，员工和客户共用账号或组织不能合并收件箱。
 
 ## 生产环境
 
@@ -30,6 +34,8 @@ docker build --build-arg SOURCE_REVISION=<完整提交SHA> -t saas-notification:
 指标 token 与平台签名密钥、数据库密码独立，使用 32–256 个 URL-safe 随机字符。完整的计时、队列与并发参数见 [开发指南](development.md)和 [配置模板](../config.env.example)。修改预算后依据连接数、队列等待、丢提示与平台验证指标重新测量容量。
 
 服务默认校验系统 CA。私有 CA 通过 `NOTIFICATION_PLATFORM_CA_FILE` 指向只读挂载的 PEM 公共证书文件，保留主机名和证书链验证；镜像内实际 UID 必须可读。平台 API 不跟随重定向，需直接配置最终 HTTPS origin，且容器必须可解析和访问该公开平台地址。
+
+平台 origin 必须提供 `GET /api/internal/notifications/context-proof`。此路径消费平台会话 Bearer，并在逐条投递时接收 `notificationId`；未经认证的健康探针应得到 401。成功响应是 `proofVersion="1"` 的精确十一字段私有证明，不能改用公开 socket-context 响应或代理缓存证明。身份版本为至少 1 的 i64 整数，账号版本为至少 0 的 i64 整数；完整字段见[开发指南](development.md)。代理和网络规则须允许该内部调用，并保留认证头与 query。
 
 ## 与平台 Compose 集成
 
@@ -61,7 +67,11 @@ docker compose --env-file /srv/saas/private/platform.env --env-file /srv/saas/pr
 
 ## 验收、监控与退出
 
-验收顺序为数据库迁移与账号、平台 HTTPS、通知依赖就绪、浏览器首次认证、真实通知发布与 HTTP 收件箱、实时提示、撤权/到期、网络恢复及进程退出。`/health/live` 正常只说明进程可响应；`/health/ready` 还要求 database、listen、platform 全部 UP。
+验收顺序为数据库迁移与列权限、平台 HTTPS 与内部证明接口、通知依赖就绪、浏览器首次认证、真实通知发布与 HTTP 收件箱、实时提示、成员及账号撤权/到期、网络恢复及进程退出。`/health/live` 正常只说明进程可响应；`/health/ready` 还要求 database、listen、platform 全部 UP。
+
+投递验收需区分同账号同组织的员工与客户、同成员的不同身份版本：员工通知不能被客户连接或新代连接读取；局部成员停用不得撤销另一有效身份，全局账号撤销则应作用于全部连接。旧四字段 LISTEN 提示和 recipient 证明缺失的旧行必须拒绝投递。新提示精确包含八字段，以 `hintVersion="1"` 标识；调度分区包含 user、tenant、organization、membership、memberType 和 identityVersion，账号版本仅由连接证明校验。浏览器的 `{ token }`、五字段 `authenticated` 和十二字段 `notification` 继续使用 Notification 1 公共合同，不暴露私有证明。
+
+`tests/identity_isolation.rs` 使用真实通知服务、隔离 PostgreSQL 和受控 HTTP authority；执行条件见[开发指南](development.md)。平台真实成员／通知授权由平台 PostgreSQL 测试验证，不能将这两组证据称为两个真实服务的端到端联调。部署仍须使用实际平台发布 API、实际会话和浏览器完成上述链路，记录真实结果；本文不表示这些门禁或部署验收已经通过。
 
 私网使用独立 Bearer 抓取 `/metrics`，重点观察连接数、验证并发/失败/耗时、LISTEN 重连、队列等待、提示丢弃和发送接受量。丢提示不改变持久通知，恢复依靠客户端 HTTP 补拉，发送指标不能作为用户已读统计。
 
@@ -71,4 +81,6 @@ docker compose --env-file /srv/saas/private/platform.env --env-file /srv/saas/pr
 
 升级前记录镜像摘要、源码修订、平台通知协议、Socket.IO 客户端版本、路径、来源、预算和 CA 配置。在隔离环境重跑传输、认证、撤权、恢复与依赖故障矩阵，再替换生产摘要。
 
-回退时恢复兼容镜像和配置，或临时关闭公开实时路由并保留平台 HTTP 收件箱。通知服务不拥有数据库迁移和持久记录；回退无需通过重发业务事件补偿实时提示。涉及平台通知结构变更时，先确认新旧平台与通知服务组合的兼容性。
+成员隔离升级按平台 recipient 存储与触发器迁移、`notification-role.sql` 列权限、匹配内部证明和八字段提示的通知镜像顺序交付。提前部署的新服务拒绝旧四字段提示；升级窗口可能缺少实时提示，客户端通过当前授权下的 HTTP 收件箱补拉。发布前验证目标组合，不能通过放宽解析或给旧记录补绑成员来恢复提示。
+
+回退时恢复仍能校验具体成员与身份版本的兼容镜像和配置，或临时关闭公开实时路由并保留平台 HTTP 收件箱。通知服务不拥有数据库迁移和持久记录；回退无需通过重发业务事件补偿实时提示。涉及平台通知结构变更时，先确认新旧平台与通知服务组合的兼容性，不能回退到仅按用户／组织猜测身份的投递行为。

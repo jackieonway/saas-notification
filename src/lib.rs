@@ -1,5 +1,6 @@
 //! Bounded notification delivery. PostgreSQL inbox rows remain authoritative.
 mod config;
+mod identifiers;
 mod metrics;
 mod platform;
 mod protocol;

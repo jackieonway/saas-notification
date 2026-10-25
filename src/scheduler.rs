@@ -141,7 +141,7 @@ impl<K: Clone + Eq + Hash, V> Sender<K, V> {
     /// Queue one hint, or immediately discard it when a limit is reached.
     ///
     /// No producer waits for a slow recipient. This function must receive a
-    /// complete user/tenant/organization key; there is no identity inference.
+    /// complete recipient membership/generation key; there is no identity inference.
     pub(crate) fn try_enqueue(&self, key: K, value: V) -> bool {
         let mut state = self.shared.lock();
         let limits = self.shared.limits;
@@ -320,7 +320,9 @@ impl<K, V> Drop for Runner<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{Identity, MemberType};
     use tokio::sync::{mpsc, Semaphore};
+    use uuid::Uuid;
 
     fn limits() -> Limits {
         Limits {
@@ -346,6 +348,46 @@ mod tests {
         })
         .await
         .expect("coordinator must account for completed handlers");
+    }
+
+    #[test]
+    fn concrete_memberships_and_identity_generations_have_independent_queue_limits() {
+        let employee = Identity {
+            user_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            organization_id: Uuid::now_v7(),
+            membership_id: Uuid::now_v7(),
+            member_type: MemberType::Employee,
+            identity_version: 1,
+        };
+        let customer = Identity {
+            membership_id: Uuid::now_v7(),
+            member_type: MemberType::Customer,
+            ..employee
+        };
+        let next_generation = Identity {
+            identity_version: 2,
+            ..employee
+        };
+        let (sender, _runner) = channel(Limits {
+            max_partitions: 3,
+            per_partition_queue: 2,
+            total_queue: 8,
+            concurrency: 2,
+        })
+        .unwrap();
+        assert!(sender.try_enqueue(employee, 1));
+        assert!(sender.try_enqueue(customer, 1));
+        assert!(sender.try_enqueue(next_generation, 1));
+        assert!(sender.try_enqueue(employee, 2));
+        assert!(!sender.try_enqueue(employee, 3));
+        assert!(sender.try_enqueue(customer, 2));
+        let snapshot = sender.snapshot();
+        assert_eq!(
+            (snapshot.partitions, snapshot.queued, snapshot.active),
+            (3, 5, 0)
+        );
+        assert_eq!((snapshot.accepted, snapshot.dropped), (5, 1));
     }
 
     #[tokio::test]

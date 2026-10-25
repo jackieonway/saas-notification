@@ -65,16 +65,44 @@ cargo run --locked --bin saas-notification-ws
 | `NOTIFICATION_MAX_INFLIGHT` | 8 | 1–256，同时处理的分区数 |
 | `NOTIFICATION_VALIDATION_CONCURRENCY` | 16 | 1–256，不大于最大连接数 |
 
-分区键为用户/租户/组织，单分区按接收次序处理，跨分区可并行。提示超预算会被丢弃并计入指标，持久通知继续通过 HTTP 可见。Socket.IO 接收 payload 和 WS 消息/帧当前各限 8 KiB，发送缓冲为 32 条。
+分区键为 `userId / tenantId / organizationId / membershipId / memberType / identityVersion`，单分区按接收次序处理，跨分区可并行。同账号同组织的员工和客户，以及同成员的不同身份版本，均属于独立分区。`accountVersion` 只绑定连接证明，不进入提示或分区键。提示超预算会被丢弃并计入指标，持久通知继续通过 HTTP 可见。Socket.IO 接收 payload 和 WS 消息/帧当前各限 8 KiB，发送缓冲为 32 条。
+
+## 内部证明与收件成员
+
+服务以平台会话 Bearer 调用 `GET /api/internal/notifications/context-proof`。首次认证和周期复验读取当前上下文；逐条投递时额外传递 `notificationId`，由平台重新证明该通知对具体成员和身份版本可见。内部接口不签发或刷新令牌，通知服务也不持有签名密钥。
+
+响应必须精确包含以下十一字段，缺失、额外字段、错误版本或非法值均拒绝，不能把旧公开 socket-context 响应当作内部证明：
+
+| 字段 | 约束 |
+| --- | --- |
+| `proofVersion` | 字符串，精确为 `"1"` |
+| `contractVersion` | 字符串，精确为 `"1.0"` |
+| `userId` | 当前账号 UUID v7 |
+| `tenantId` | 当前租户 UUID v7 |
+| `organizationId` | 当前组织 UUID v7 |
+| `sessionId` | 当前会话 UUID v7 |
+| `expiresAt` | 尚未到期的 RFC 3339 时间 |
+| `membershipId` | 当前具体成员 UUID v7 |
+| `memberType` | 精确为 `EMPLOYEE` 或 `CUSTOMER`；能否进入通知由平台用途策略决定 |
+| `identityVersion` | JSON 整数，位于有符号 i64 范围且至少为 1 |
+| `accountVersion` | JSON 整数，位于有符号 i64 范围且至少为 0 |
+
+所有 UUID 均使用规范带连字符的 v7 和 RFC variant。版本值不接受字符串、小数、负值或溢出整数。连接首次绑定完整证明，此后复验不得改绑账号、租户、组织、session、成员、成员类型、身份版本或账号版本，也不得延长首次期限。撤权、成员停用或替换、账号版本变化、期限耗尽及权威 HTTP 故障均使连接不能继续获得授权。
+
+`new_notification` 的私有提示必须精确包含八字段：`hintVersion`、`id`、`userId`、`tenantId`、`organizationId`、`membershipId`、`memberType`、`identityVersion`。`hintVersion` 精确为字符串 `"1"`；`id` 为通知 UUID v7，其余身份字段和版本遵循上表相同约束。提示不含 `sessionId`、`accountVersion` 或正文。旧四字段提示、缺字段或多字段提示一律丢弃，不根据当前账号或组织推测成员。
+
+服务只读持久通知的 `recipient_membership_id`、`recipient_member_type`、`recipient_identity_version`，将其与提示和连接证明逐项匹配，再执行逐条平台可见性校验。旧行中任一 recipient 证明为 NULL 时仅保留归档，服务不补绑、不迁移，也不向当前成员投递。首版客户通知保持关闭，默认广播仅面向有效员工；私有协议中的客户类型不代表客户通知用途已经开放。
+
+Notification 1 公共合同保持不变：认证输入严格为 `{ token }`；`authenticated` 只含 `contractVersion / userId / tenantId / organizationId / expiresAt` 五字段；`notification` 只含 `contractVersion / id / userId / tenantId / organizationId / applicationId / publicationId / type / title / content / link / createdAt` 十二字段。内部成员、身份版本、账号版本和 session 证明不出现在公共载荷中。
 
 ## 源码导航
 
 | 模块 | 职责 |
 | --- | --- |
 | `config.rs` | 读取并验证显式环境配置 |
-| `platform.rs` | 有界平台会话和逐条通知可见性校验 |
+| `platform.rs` | 有界内部上下文证明和逐条通知可见性校验 |
 | `protocol.rs` | 身份、认证输入、数据库提示和公开通知 DTO |
-| `store.rs` | 只读通知查询、LISTEN、健康与重连 |
+| `store.rs` | 按 recipient 成员证明读取通知、LISTEN、健康与重连 |
 | `scheduler.rs` | 身份分区、有界队列、公平调度与关闭 |
 | `server.rs` | Origin、Socket.IO、连接绑定、复验、投递与服务编排 |
 | `transport.rs` | TCP 所有权与物理关闭，覆盖未完成握手和空闲连接 |
@@ -97,6 +125,16 @@ cargo test --locked --all-targets
 
 联调使用平台宿主已有通知连接；它在 `connect` 后发送一次平台会话令牌，收到并校验 `authenticated` 后补拉 HTTP 收件箱、未读数和偏好。应用令牌用于 SDK 发布通知，Socket.IO 连接使用平台会话上下文。
 
-逐项验证：polling、直接 WebSocket、polling 升级；非法/缺失 Origin；首次认证超时、重复认证、错误令牌；用户/租户/组织/session 变化；到期与撤权；每条通知可见性；数据库中断和 LISTEN 重连；平台 API 不可用；队列过载；断网恢复与 HTTP 补拉；退出后不存在遗留连接或后台任务。使用实际授权 API 发布测试通知，避免绕过持久化和授权直接伪造数据库提示作为完整验收。
+逐项验证：polling、直接 WebSocket、polling 升级；非法/缺失 Origin；首次认证超时、重复认证、错误令牌；用户/租户/组织/session/成员/成员类型/身份版本/账号版本变化；到期与撤权；同组织双身份及旧代消息隔离；每条通知可见性；数据库中断和 LISTEN 重连；平台 API 不可用；队列过载；断网恢复与 HTTP 补拉；退出后不存在遗留连接或后台任务。使用实际授权 API 发布测试通知，避免绕过持久化和授权直接伪造数据库提示作为完整验收。
+
+身份隔离专项位于 `tests/identity_isolation.rs`，包含三个默认忽略的服务集成测试，仅使用 `IDENTITY_PHASE04_TEST_DATABASE_URL` 和 `CI_TEST_POSTGRES_OWNER` 显式选择独占测试 PostgreSQL。owner 必须以 `ci-` 开头、仅含 ASCII 字母数字和连字符，最长 63 字节；URL 仅允许 `postgres/postgresql`、loopback 主机 `localhost/127.0.0.1/::1`，不允许 query 或 fragment。运行时填写独占实例的显式端口和 `/postgres` 管理库；测试的管理员连接固定使用 `postgres`，为每次运行创建随机新库并清理，不接受普通 `TEST_DATABASE_URL` 作为替代。示例值仅用于已由测试运行者独占的实例：
+
+```powershell
+$env:IDENTITY_PHASE04_TEST_DATABASE_URL = 'postgresql://ci_test_admin:REPLACE_PASSWORD@127.0.0.1:45432/postgres'
+$env:CI_TEST_POSTGRES_OWNER = 'ci-notification-phase04'
+cargo test --locked --test identity_isolation -- --ignored --nocapture --test-threads=1
+```
+
+专项运行真实通知服务、真实隔离 PostgreSQL 和受控 HTTP authority，验证成员代际、连接撤权、旧提示／旧行拒绝与公共载荷；平台接口由 fixture 模拟，其真实成员资格和通知授权必须由平台自身 PostgreSQL 测试另行证明。该专项不等同于两个真实服务共同运行的端到端验收。这里列出执行要求，不表示本次文档更新已经运行或通过 Rust 门禁、数据库专项或浏览器联调。
 
 常见定位顺序为 `/health/ready` 三项状态、私网指标、平台接口状态、数据库只读权限、来源与代理路径。日志只记录公开请求标识和固定错误，不输出令牌、数据库 URL、平台原始响应或身份上下文。

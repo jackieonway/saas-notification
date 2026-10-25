@@ -1,7 +1,8 @@
 use crate::{
     config::Config,
+    identifiers,
     metrics::{Health, Metrics},
-    protocol::{Hint, Identity, Notification},
+    protocol::{Hint, Identity, MemberType, Notification, StoredDelivery},
     scheduler::Sender,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -21,7 +22,7 @@ use uuid::Uuid;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const NOTIFICATION_QUERY:&str="SELECT id,user_id,tenant_id,organization_id,source_kind,application_id,publication_id,type,title,content,link,created_at FROM notifications WHERE id=$1 AND tenant_id=$2 AND organization_id=$3 AND user_id=$4 AND source_kind IN ('APP','SYSTEM')";
+const NOTIFICATION_QUERY:&str="SELECT id,user_id,tenant_id,organization_id,recipient_membership_id,recipient_member_type,recipient_identity_version,source_kind,application_id,publication_id,type,title,content,link,created_at FROM notifications WHERE id=$1 AND tenant_id=$2 AND organization_id=$3 AND user_id=$4 AND recipient_membership_id=$5 AND recipient_member_type=$6 AND recipient_identity_version=$7 AND source_kind IN ('APP','SYSTEM')";
 
 pub(crate) enum StoreError {
     Database(sqlx::Error),
@@ -84,7 +85,7 @@ impl Store {
         })
     }
 
-    pub(crate) async fn get(&self, hint: &Hint) -> Result<Option<Notification>, StoreError> {
+    pub(crate) async fn get(&self, hint: &Hint) -> Result<Option<StoredDelivery>, StoreError> {
         let row = tokio::time::timeout(
             QUERY_TIMEOUT,
             sqlx::query(NOTIFICATION_QUERY)
@@ -92,6 +93,9 @@ impl Store {
                 .bind(hint.identity.tenant_id)
                 .bind(hint.identity.organization_id)
                 .bind(hint.identity.user_id)
+                .bind(hint.identity.membership_id)
+                .bind(hint.identity.member_type.as_str())
+                .bind(hint.identity.identity_version)
                 .fetch_optional(&self.pool),
         )
         .await
@@ -104,6 +108,9 @@ impl Store {
             user_id: row.try_get("user_id")?,
             tenant_id: row.try_get("tenant_id")?,
             organization_id: row.try_get("organization_id")?,
+            recipient_membership_id: row.try_get("recipient_membership_id")?,
+            recipient_member_type: row.try_get("recipient_member_type")?,
+            recipient_identity_version: row.try_get("recipient_identity_version")?,
             source_kind: row.try_get("source_kind")?,
             application_id: row.try_get("application_id")?,
             publication_id: row.try_get("publication_id")?,
@@ -118,7 +125,7 @@ impl Store {
 
     pub(crate) async fn probe(&self) -> bool {
         tokio::time::timeout(QUERY_TIMEOUT,sqlx::query(
-            "SELECT id,user_id,tenant_id,organization_id,source_kind,application_id,publication_id,type,title,content,link,created_at FROM notifications WHERE source_kind IN ('APP','SYSTEM') LIMIT 0"
+            "SELECT id,user_id,tenant_id,organization_id,recipient_membership_id,recipient_member_type,recipient_identity_version,source_kind,application_id,publication_id,type,title,content,link,created_at FROM notifications WHERE source_kind IN ('APP','SYSTEM') LIMIT 0"
         ).execute(&self.pool)).await.is_ok_and(|result|result.is_ok())
     }
 
@@ -197,7 +204,9 @@ impl Store {
                 return;
             }
             metrics.listen_reconnects.fetch_add(1, Ordering::Relaxed);
-            let jitter = Uuid::new_v4().as_bytes()[0];
+            // v7's leading bytes encode time, so draw jitter independently
+            // from the CSPRNG instead of extracting any UUID prefix.
+            let jitter = rand::random::<u8>();
             let delay = retry_delay(self.retry, failures, jitter);
             failures = failures.saturating_add(1);
             tokio::select! {_=cancel.cancelled()=>return,_=tokio::time::sleep(delay)=>{}}
@@ -222,6 +231,9 @@ struct Record {
     user_id: Uuid,
     tenant_id: Option<Uuid>,
     organization_id: Option<Uuid>,
+    recipient_membership_id: Option<Uuid>,
+    recipient_member_type: Option<String>,
+    recipient_identity_version: Option<i64>,
     source_kind: String,
     application_id: Option<Uuid>,
     publication_id: Option<Uuid>,
@@ -233,11 +245,30 @@ struct Record {
 }
 
 impl Record {
-    fn notification(self, hint: &Hint) -> Option<Notification> {
-        if self.id != hint.id
+    fn notification(self, hint: &Hint) -> Option<StoredDelivery> {
+        if !identifiers::valid(self.id)
+            || !identifiers::valid(self.user_id)
+            || self.tenant_id.is_none_or(|id| !identifiers::valid(id))
+            || self
+                .organization_id
+                .is_none_or(|id| !identifiers::valid(id))
+            || self
+                .application_id
+                .is_some_and(|id| !identifiers::valid(id))
+            || self
+                .publication_id
+                .is_some_and(|id| !identifiers::valid(id))
+            || self.id != hint.id
             || self.user_id != hint.identity.user_id
             || self.tenant_id != Some(hint.identity.tenant_id)
             || self.organization_id != Some(hint.identity.organization_id)
+            || self.recipient_membership_id != Some(hint.identity.membership_id)
+            || self
+                .recipient_member_type
+                .as_deref()
+                .and_then(MemberType::parse)
+                != Some(hint.identity.member_type)
+            || self.recipient_identity_version != Some(hint.identity.identity_version)
             || self.title.is_empty()
             || !matches!(
                 self.kind.as_str(),
@@ -251,7 +282,7 @@ impl Record {
             "SYSTEM" if self.application_id.is_none() && self.publication_id.is_none() => {}
             _ => return None,
         }
-        Some(Notification {
+        let notification = Notification {
             contract_version: "1.0",
             id: self.id,
             user_id: self.user_id,
@@ -264,6 +295,10 @@ impl Record {
             content: self.content.unwrap_or_default(),
             link: self.link.unwrap_or_default(),
             created_at: self.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        };
+        Some(StoredDelivery {
+            recipient: hint.identity,
+            notification,
         })
     }
 }
@@ -271,13 +306,19 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn id(value: u128) -> Uuid {
+        Uuid::from_u128(0x0196_0000_0000_7000_8000_0000_0000_0000 | value)
+    }
     fn hint() -> Hint {
         Hint {
-            id: Uuid::from_u128(1),
+            id: id(1),
             identity: Identity {
-                user_id: Uuid::from_u128(2),
-                tenant_id: Uuid::from_u128(3),
-                organization_id: Uuid::from_u128(4),
+                user_id: id(2),
+                tenant_id: id(3),
+                organization_id: id(4),
+                membership_id: id(5),
+                member_type: MemberType::Employee,
+                identity_version: 1,
             },
         }
     }
@@ -288,6 +329,9 @@ mod tests {
             user_id: hint.identity.user_id,
             tenant_id: Some(hint.identity.tenant_id),
             organization_id: Some(hint.identity.organization_id),
+            recipient_membership_id: Some(hint.identity.membership_id),
+            recipient_member_type: Some(hint.identity.member_type.as_str().into()),
+            recipient_identity_version: Some(hint.identity.identity_version),
             source_kind: "SYSTEM".into(),
             application_id: None,
             publication_id: None,
@@ -301,10 +345,10 @@ mod tests {
     #[test]
     fn persisted_rows_require_exact_owner_source_and_publication_shape() {
         let event = record().notification(&hint()).unwrap();
-        assert_eq!(event.identity(), hint().identity);
-        assert_eq!(event.content, "");
+        assert_eq!(event.recipient, hint().identity);
+        assert_eq!(event.notification.content, "");
         let mut wrong = record();
-        wrong.tenant_id = Some(Uuid::from_u128(99));
+        wrong.tenant_id = Some(id(99));
         assert!(wrong.notification(&hint()).is_none());
         let mut legacy = record();
         legacy.source_kind = "LEGACY".into();
@@ -313,16 +357,43 @@ mod tests {
         app.source_kind = "APP".into();
         assert!(app.notification(&hint()).is_none());
         let mut system = record();
-        system.application_id = Some(Uuid::from_u128(99));
+        system.application_id = Some(id(99));
         assert!(system.notification(&hint()).is_none());
         let mut kind = record();
         kind.kind = "UNKNOWN".into();
         assert!(kind.notification(&hint()).is_none());
         let mut app = record();
         app.source_kind = "APP".into();
-        app.application_id = Some(Uuid::from_u128(8));
-        app.publication_id = Some(Uuid::from_u128(9));
+        app.application_id = Some(id(8));
+        app.publication_id = Some(id(9));
         assert!(app.notification(&hint()).is_some());
+        let mut app = record();
+        app.source_kind = "APP".into();
+        app.application_id = Some(id(8));
+        // Explicit v4 persisted-row negative: hint IDs are already valid v7.
+        app.publication_id = Some(Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap());
+        assert!(app.notification(&hint()).is_none());
+    }
+    #[test]
+    fn archived_rows_and_another_membership_or_generation_never_match_a_hint() {
+        let mut legacy = record();
+        legacy.recipient_membership_id = None;
+        legacy.recipient_member_type = None;
+        legacy.recipient_identity_version = None;
+        assert!(legacy.notification(&hint()).is_none());
+        let mut wrong = record();
+        wrong.recipient_membership_id = Some(id(99));
+        assert!(wrong.notification(&hint()).is_none());
+        let mut wrong = record();
+        wrong.recipient_member_type = Some("CUSTOMER".into());
+        assert!(wrong.notification(&hint()).is_none());
+        let mut wrong = record();
+        wrong.recipient_identity_version = Some(2);
+        assert!(wrong.notification(&hint()).is_none());
+        let mut wrong = record();
+        wrong.recipient_membership_id =
+            Some(Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap());
+        assert!(wrong.notification(&hint()).is_none());
     }
     #[test]
     fn retry_is_jittered_exponential_and_absolutely_bounded() {
@@ -344,7 +415,8 @@ mod tests {
     }
     #[test]
     fn notification_dto_exposes_only_the_versioned_public_fields() {
-        let value = serde_json::to_value(record().notification(&hint()).unwrap()).unwrap();
+        let value =
+            serde_json::to_value(record().notification(&hint()).unwrap().notification).unwrap();
         let keys = value
             .as_object()
             .unwrap()
