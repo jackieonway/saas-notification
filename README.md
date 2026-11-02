@@ -4,6 +4,8 @@
 
 qiankun 负责前端宿主与微应用的生命周期。本仓库没有前端入口，也不实现微应用 loader、iframe 或 SDK bridge；采用 qiankun 后，通知仍通过独立网络服务工作。微应用使用 [SDK 3.0.0](../saas-micro-app-sdk/README.md)向平台发布通知，宿主建立 Socket.IO 连接接收提示。
 
+宿主在业务身份切换开始时同步断开旧连接，其他标签页也收到冻结提示；切换完成后以新平台来源重新订阅。服务继续按精确 session、成员类型和代际在线复验，不在同一连接上改绑身份。同账号客户关系不能接收员工通知，单独的账号 SSO 也不构成通知授权。外部 canonical USER 的业务后端发布使用平台[私有发布／原结果恢复合同](../saas-plateform/backend/docs/designs/unified-auth/phase-18-private-notification-contract.md)，不会把 OAuth token 传入当前 Socket.IO authenticate 或转为虚构内部会话。本服务不承担发布补偿。
+
 ## 阅读入口
 
 | 任务 | 文档 / 文件 |
@@ -13,6 +15,8 @@ qiankun 负责前端宿主与微应用的生命周期。本仓库没有前端入
 | 环境变量示例 | [config.env.example](config.env.example) |
 | 当前 Rust 与依赖版本 | [rust-toolchain.toml](rust-toolchain.toml)、[Cargo.toml](Cargo.toml)、[Cargo.lock](Cargo.lock) |
 | CI 真实检查命令 | [.github/workflows/ci.yml](.github/workflows/ci.yml) |
+
+`PLATFORM_API_BASE_URL` 指向已配置的私有 HTTPS listener，必须允许准确的 `/api/internal/notifications/context-proof`，通过 CA 和主机名校验证书；它不能指向拒绝私有路径的浏览器公开网关。部署责任人须核对实际监听地址／端口、网络访问范围和 CA 挂载。示例 private 域名不表示该入口已存在；缺少这些事实时，发布前置仍未满足。
 
 ## 数据与认证流程
 
